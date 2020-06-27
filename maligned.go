@@ -27,7 +27,6 @@ func main() {
 	if len(importPaths) == 0 {
 		return
 	}
-
 	var conf loader.Config
 	conf.TypeChecker.Sizes = types.SizesFor(build.Default.Compiler, build.Default.GOARCH)
 	conf.Fset = fset
@@ -62,19 +61,60 @@ func malign(pos token.Pos, str *types.Struct) {
 	}
 
 	s := gcSizes{wordSize, maxAlign}
-	sz, opt := s.Sizeof(str), optimalSize(str, &s)
-	if sz != opt {
-		fmt.Printf("%s: struct of size %d could be %d\n", fset.Position(pos), sz, opt)
+	sz := s.Sizeof(str)
+	optFlattened, optNotFlattened := optimalSize(str, &s)
+	if sz != optNotFlattened {
+		fmt.Printf("%s: struct of size %d could be %d after rearranging\n", fset.Position(pos), sz, optNotFlattened)
+		if optNotFlattened != optFlattened {
+			fmt.Printf("%s: struct of size %d could be %d after flattening and rearranging\n", fset.Position(pos), sz, optFlattened)
+		}
 	}
 }
 
-func optimalSize(str *types.Struct, sizes *gcSizes) int64 {
+func getFlattenedFields(field *types.Var, result []*types.Var) []*types.Var {
+	switch t := field.Type().Underlying().(type) {
+	case *types.Array:
+		len := t.Len()
+		elemType := t.Elem()
+		for i := int64(0); i < len; i++ {
+			newVar := types.NewVar(0, field.Pkg(), fmt.Sprintf("arrayElem#%d", i), elemType)
+			result = getFlattenedFields(newVar, result)
+		}
+	case *types.Struct:
+		nf := t.NumFields()
+		for i := 0; i < nf; i++ {
+			result = getFlattenedFields(t.Field(i), result)
+		}
+	default:
+		result = append(result, field)
+	}
+	return result
+}
+
+func optimalSize(str *types.Struct, sizes *gcSizes) (flattenedSize int64, notFlattenedSize int64) {
 	nf := str.NumFields()
-	fields := make([]*types.Var, nf)
+
+	notFlattened := make([]*types.Var, nf)
+	for i := 0; i < nf; i++ {
+		notFlattened[i] = str.Field(i)
+	}
+
+	flattened := make([]*types.Var, 0, nf)
+	for i := 0; i < nf; i++ {
+		flattened = getFlattenedFields(str.Field(i), flattened)
+	}
+	// fix names
+	for i, f := range flattened {
+		flattened[i] = types.NewVar(f.Pos(), f.Pkg(), fmt.Sprintf("%s_%d", f.Name(), i), f.Type())
+	}
+	return sortedSize(flattened, sizes), sortedSize(notFlattened, sizes)
+}
+
+func sortedSize(fields []*types.Var, sizes *gcSizes) int64 {
+	nf := len(fields)
 	alignofs := make([]int64, nf)
 	sizeofs := make([]int64, nf)
 	for i := 0; i < nf; i++ {
-		fields[i] = str.Field(i)
 		ft := fields[i].Type()
 		alignofs[i] = sizes.Alignof(ft)
 		sizeofs[i] = sizes.Sizeof(ft)
